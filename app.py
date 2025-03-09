@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS, cross_origin
 from PIL import Image
 import os
 import cv2
@@ -9,16 +10,26 @@ from sklearn.preprocessing import normalize
 from face_detector import YoloV5FaceDetector
 from tqdm import tqdm
 import glob2
+print("START")
 
-def init_det_and_emb_model(model_file):
+# Initialize Flask app
+app = Flask(__name__)
+CORS(app)
+
+# Load models and embeddings before running the Flask app
+model_file = "models/GhostFaceNet_W1.3_S2_ArcFace.h5"
+embeddings_file = "known_user/image-dataset_aligned_112_112_embedding.npz"
+known_user = "known_user/image-dataset_aligned_112_112_embedding.npz"
+# known_user = "known_user/embeddings.npz"
+
+def init_det_and_emb_model(model_file, embeddings_file):
     det = YoloV5FaceDetector()
     face_model = tf.keras.models.load_model(model_file, compile=False)
-    # data = np.load(embeddings_file)
-    # image_classes, image_class_name, embeddings = data["imm_classes"], data["imm_class_names"], data["embs"]
-    return det, face_model
+    data = np.load(embeddings_file)
+    image_classes, image_class_name, embeddings = data["image_classes"], data["image_class_names"], data["embeddings"]
+    return det, face_model, image_classes, image_class_name, embeddings
 
 def face_align_landmarks_sk(img, landmarks, image_size=(112, 112)):
-    # Alignment function for face landmarks
     from skimage import transform
     src = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
     ret = []
@@ -32,7 +43,7 @@ def do_detect_in_image(image, det, image_format="BGR"):
     print('detecting face from image')
     imm_BGR = image if image_format == "BGR" else image[:, :, ::-1]
     imm_RGB = image[:, :, ::-1] if image_format == "BGR" else image
-    bboxes, pps, ccs = det.__call__(imm_BGR)
+    bboxes, pps, ccs = det._call_(imm_BGR)
     # nimgs = face_align_landmarks_sk(imm_RGB, pps)
 
     nimgs = face_align_landmarks_sk(imm_RGB, pps)
@@ -54,7 +65,7 @@ def embedding_images(det, face_model, known_user, batch_size=32, force_reload=Fa
             return [], [], None
         # data_gen = ImageDataGenerator(preprocessing_function=lambda img: (img - 127.5) * 0.0078125)
         # img_gen = data_gen.flow_from_directory(known_user, target_size=(112, 112), batch_size=1, class_mode='binary')
-        image_names = glob2.glob(os.path.join(known_user, "*/*.jpg"))
+        image_names = glob2.glob(os.path.join(known_user, "/.jpg"))
 
         """ Detct faces in images, keep only those have exactly one face. """
         nimgs, image_classes, image_class_names = [], [], []
@@ -79,9 +90,8 @@ def embedding_images(det, face_model, known_user, batch_size=32, force_reload=Fa
     print(">>>> image_classes info:")
     print(image_classes.shape)
     return image_classes, image_class_names, embeddings, dest_pickle
-
-
-def recognize_image(det, face_model, image_classes, image_class_name, embeddings, frame, dist_thresh=0.6, image_format='BGR'):
+    
+def recognize_image(det, face_model, image_class_name, embeddings, frame, dist_thresh=0.6, image_format='BGR'):
     print('start recognize image')
     if isinstance(frame, str):
         frame = imread(frame)
@@ -96,7 +106,6 @@ def recognize_image(det, face_model, image_classes, image_class_name, embeddings
     dists = np.dot(embeddings, emb_unk.T).T
     rec_idx = dists.argmax(-1)
     rec_dist = [dists[id, ii] for id, ii in enumerate(rec_idx)]
-    # rec_class = [image_classes[ii] if dist > dist_thresh else "Unknown" for dist, ii in zip(rec_dist, rec_idx)]
     rec_class = [image_class_name[ii] if dist > dist_thresh else "Unknown" for dist, ii in zip(rec_dist, rec_idx)]
     
     return rec_dist, rec_class, bbs, ccs
@@ -109,44 +118,63 @@ def draw_polyboxes(frame, rec_dist, rec_class, bbs, dist_thresh=0.6):
         cv2.putText(frame, f"Label: {label}, dist: {dist:.4f}", (left, up - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     return frame
 
-model_file = "/models/GhostFaceNet_W1.3_S2_ArcFace.h5"
-embeddings_file = "/known_user/embeddings.npz"
-image_path = '/check/ibe1.jpg'
-dist_thresh = 0.6
+
+det, face_model, image_classes, image_class_name, embeddings = init_det_and_emb_model(model_file, known_user)
+
+@app.route('/recognize', methods=['POST'])
+@cross_origin(origin='*')
+def recognize():
+    # Check if the request contains a file
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    
+    file = request.files['file']
+    
+    # Read the image file
+    try:
+        image = imread(file)
+    except Exception as e:
+        return jsonify({"error": f"Failed to read image: {e}"}), 400
+    
+    # Set the distance threshold
+    dist_thresh = request.form.get('dist_thresh', default=0.6, type=float)
+    
+    # Recognize faces in the image
+    rec_dist, rec_class, bbs, ccs = recognize_image(det, face_model, image_class_name, embeddings, image, dist_thresh)
+    
+    # Prepare the response
+    response = {
+        "recognized_faces": [
+            {
+                "label": label,
+                "distance": round(float(dist), 2),
+            }
+            for label, dist, bb in zip(rec_class, rec_dist, bbs)
+        ]
+    }
+
+    print(response)
+    
+    return jsonify(response)
+
+# Run the Flask app
+if __name__ == "_main_":    
+    print("run app...")
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+
+# model_file = "models/GhostFaceNet_W1.3_S2_ArcFace.h5"
+# embeddings_file = "known_user/image-dataset_aligned_112_112_embedding.npz"
+# image_path = 'check/hazman.jpg'
+# dist_thresh = 0.6
+# known_user = "known_user/embeddings.npz"
+# det, face_model = init_det_and_emb_model(model_file)
+# image_classes, image_class_name, embeddings, embbeddings_file_path = read_embedding_file(known_user)
+# frame = imread(image_path)
+# rec_dist, rec_class, bbs, ccs = recognize_image(det, face_model, image_classes, image_class_name, embeddings, frame, dist_thresh)
+# print(rec_class)
+# print(rec_dist)
+# embeddings_file = "known_user/embeddings.npz"
 # known_user = '/kaggle/working/image-dataset_aligned_112_112/'
-known_user = "/known_user/embeddings.npz"
-det, face_model = init_det_and_emb_model(model_file)
-image_classes, image_class_name, embeddings, _ = embedding_images(det, face_model, known_user)
-frame = imread(image_path)
+# image_classes, image_class_name, embeddings = embedding_images(det, face_model, known_user)
 # rec_dist, rec_class, bbs = recognize_image(det, face_model, image_classes, embeddings, frame, dist_thresh)
-rec_dist, rec_class, bbs, ccs = recognize_image(det, face_model, image_classes, image_class_name, embeddings, frame, dist_thresh)
-print(rec_class)
-print(rec_dist)
-
-# # Flask route to handle POST requests
-# @app.route("/verify", methods=["POST"])
-# def verify():
-#     # Check if an image is provided in the request
-    # if "image" not in request.files:
-        # return jsonify({"error": "No image provided"}), 400
-
-#     # Load and preprocess the image
-    # image_file = request.files["image"]
-    # image = Image.open(io.BytesIO(image_file.read()))
-#     processed_image = preprocess_image(image)
-
-#     # Generate embedding using the GhostFaceNets model
-#     input_embedding = model.predict(processed_image)[0]
-
-#     # Find the matching user
-#     matched_user = find_matching_user(input_embedding, known_embeddings, known_labels)
-
-#     # Return the result
-#     if matched_user:
-#         return jsonify({"match": True, "user": matched_user})
-#     else:
-#         return jsonify({"match": False, "user": None})
-
-# # Run the Flask app
-# if __name__ == "__main__":
-#     app.run(host="0.0.0.0", port=5000)
