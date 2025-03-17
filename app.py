@@ -1,15 +1,17 @@
 from flask import Flask, request, jsonify
+import tensorflow as tf
 from flask_cors import CORS, cross_origin
+import base64
 from PIL import Image
 import os
 import cv2
 import numpy as np
-import tensorflow as tf
 from skimage.io import imread
 from sklearn.preprocessing import normalize
 from face_detector import YoloV5FaceDetector
 from tqdm import tqdm
 import glob2
+from deepface import DeepFace
 print("START")
 
 # Initialize Flask app
@@ -18,15 +20,17 @@ CORS(app)
 
 # Load models and embeddings before running the Flask app
 model_file = "models/GhostFaceNet_W1.3_S2_ArcFace.h5"
-embeddings_file = "known_user/image-dataset_aligned_112_112_embedding.npz"
-known_user = "known_user/image-dataset_aligned_112_112_embedding.npz"
+embeddings_file = "known_user\embeddings_new.npz"
+known_user = "known_user\embeddings_new.npz"
+tracker = None
+bbox = None
 # known_user = "known_user/embeddings.npz"
 
 def init_det_and_emb_model(model_file, embeddings_file):
     det = YoloV5FaceDetector()
     face_model = tf.keras.models.load_model(model_file, compile=False)
     data = np.load(embeddings_file)
-    image_classes, image_class_name, embeddings = data["image_classes"], data["image_class_names"], data["embeddings"]
+    image_classes, image_class_name, embeddings = data["imm_classes"], data["imm_class_names"], data["embs"]
     return det, face_model, image_classes, image_class_name, embeddings
 
 def face_align_landmarks_sk(img, landmarks, image_size=(112, 112)):
@@ -118,6 +122,36 @@ def draw_polyboxes(frame, rec_dist, rec_class, bbs, dist_thresh=0.6):
         cv2.putText(frame, f"Label: {label}, dist: {dist:.4f}", (left, up - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     return frame
 
+def decode_base64_to_image(image_base64):
+    """Konversi base64 menjadi gambar OpenCV"""
+    try:
+        # Cek apakah string base64 mengandung header (data:image/jpeg;base64,)
+        if ',' in image_base64:
+            image_base64 = image_base64.split(',')[1] 
+        else:
+            image_base64 = image_base64  # Gunakan langsung jika tidak ada header
+
+        # Decode base64 ke bytes
+        image_bytes = base64.b64decode(image_base64)
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Gagal mendekode gambar: Data tidak valid")
+        return img
+    except Exception as e:
+        print("[ERROR] Gagal mendekode gambar:", str(e))
+        return None
+
+def detect_face(img):
+    """Deteksi wajah menggunakan OpenCV"""
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        return faces
+    except Exception as e:
+        print("[ERROR] Gagal mendeteksi wajah:", str(e))
+        return []
 
 det, face_model, image_classes, image_class_name, embeddings = init_det_and_emb_model(model_file, known_user)
 
@@ -156,6 +190,81 @@ def recognize():
     print(response)
     
     return jsonify(response)
+
+@app.route('/liveness', methods=['POST'])
+def liveness_detection():
+    global tracker, bbox
+
+    try:
+        data = request.get_json()
+        if not data or "image" not in data:
+            return jsonify({"success": False, "message": "Invalid request: No image data"}), 400
+
+        image_data = data['image']
+
+        img = decode_base64_to_image(image_data)
+        if img is None:
+            return jsonify({"success": False, "message": "Failed to decode image"}), 400
+
+        print("[INFO] Image received and decoded")
+
+        # *1. Face Detection*
+        faces = detect_face(img)
+        if len(faces) == 0:
+            return jsonify({"success": False, "message": "❌ Tidak ada wajah terdeteksi"}), 400
+
+        print("[INFO] Wajah terdeteksi!")
+
+        # *2. Face Tracking*
+        if tracker is None:
+            # Inisialisasi tracker jika belum ada
+            bbox = tuple(faces[0])  # Ambil wajah pertama yang terdeteksi
+            try:
+                # Coba gunakan cv2.legacy.TrackerKCF_create() untuk OpenCV >= 4.5.0
+                tracker = cv2.legacy.TrackerKCF_create()
+            except AttributeError:
+                # Jika gagal, gunakan cv2.TrackerKCF_create() untuk OpenCV < 4.5.0
+                tracker = cv2.TrackerKCF_create()
+            tracker.init(img, bbox)
+        else:
+            # Update tracker dengan frame saat ini
+            success, bbox = tracker.update(img)
+            if not success:
+                print("[WARNING] Tracking gagal! Menginisialisasi ulang tracker.")
+                tracker = None
+                return jsonify({"success": False, "message": "❌ Gagal melacak wajah"}), 400
+
+        # Gambar bounding box pada wajah yang dilacak
+        x, y, w, h = map(int, bbox)
+        cv2.rectangle(img, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+        # *3. Anti-Spoofing Detection dengan DeepFace*
+        try:
+            # Simpan gambar sementara untuk digunakan oleh DeepFace
+            temp_image_path = "temp_image.jpg"
+            cv2.imwrite(temp_image_path, img)
+
+            # Gunakan DeepFace untuk deteksi keaslian wajah (anti-spoofing)
+            face_objs = DeepFace.extract_faces(img_path=temp_image_path, detector_backend='opencv', enforce_detection=False, anti_spoofing=True)
+            
+            # Periksa apakah semua wajah yang terdeteksi adalah asli
+            if all(face_obj["is_real"] is True for face_obj in face_objs):
+                print("[INFO] Wajah asli terdeteksi!")
+                return jsonify({"success": True, "message": "✅ Liveness detected! Wajah asli terdeteksi!", "nim": "123456"})  # Ganti dengan NIM yang sesuai
+            else:
+                print("[WARNING] Wajah palsu terdeteksi!")
+                return jsonify({"success": False, "message": "❌ Spoofing terdeteksi!"})
+        except Exception as e:
+            print("[ERROR] Anti-spoofing gagal:", str(e))
+            return jsonify({"success": False, "message": f"Gagal melakukan anti-spoofing: {str(e)}"}), 500
+        finally:
+            # Hapus gambar sementara
+            if os.path.exists(temp_image_path):
+                os.remove(temp_image_path)
+
+    except Exception as e:
+        print("[ERROR] Server error:", str(e))
+        return jsonify({"success": False, "message": f"Server error: {str(e)}"}), 500
 
 # Run the Flask app
 if __name__ == "__main__":    
