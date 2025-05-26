@@ -20,8 +20,8 @@ CORS(app)
 
 # Load models and embeddings before running the Flask app
 model_file = "models/GhostFaceNet_W1.3_S2_ArcFace.h5"
-embeddings_file = "known_user\embeddings_new.npz"
-known_user = "known_user\embeddings_new.npz"
+embeddings_file = os.path.join("known_user", "embeddings_new.npz")
+known_user = os.path.join("known_user", "embeddings_new.npz")
 tracker = None
 bbox = None
 # known_user = "known_user/embeddings.npz"
