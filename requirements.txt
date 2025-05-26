@@ -1,0 +1,12 @@
+Flask==3.1.0
+tensorflow==2.8.0
+deepface==0.0.93
+glob2==0.7
+scikit-learn==1.6.1
+scikit-image==0.24.0
+pillow==11.1.0
+numpy==1.23.0
+pandas==2.2.3
+tqdm==4.67.1
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
