@@ -269,7 +269,7 @@ def liveness_detection():
 # Run the Flask app
 if __name__ == "__main__":    
     print("run app...")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True, port=os.getenv("PORT", default=5000))
 
 
 # model_file = "models/GhostFaceNet_W1.3_S2_ArcFace.h5"
