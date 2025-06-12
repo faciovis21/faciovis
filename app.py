@@ -1,3 +1,4 @@
+import time
 from flask import Flask, request, jsonify
 import tensorflow as tf
 from flask_cors import CORS, cross_origin
@@ -191,61 +192,32 @@ def recognize():
     
     return jsonify(response)
 
+# Function to calculate time difference in seconds
+def calculate_time_difference(start_time):
+    end_time = time.time()
+    time_difference = end_time - start_time
+    text = f"{time_difference:.2f} s"
+    return text
+
 @app.route('/liveness', methods=['POST'])
 def liveness_detection():
     global tracker, bbox
+    # Check if the request contains a file
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    
+    file = request.files['file']
+    # Read the image file
+    try:
+        image = imread(file)
+    except Exception as e:
+        return jsonify({"error": f"Failed to read image: {e}"}), 400
 
     try:
-        data = request.get_json()
-        if not data or "image" not in data:
-            return jsonify({"success": False, "message": "Invalid request: No image data"}), 400
-
-        image_data = data['image']
-
-        img = decode_base64_to_image(image_data)
-        if img is None:
-            return jsonify({"success": False, "message": "Failed to decode image"}), 400
-
-        print("[INFO] Image received and decoded")
-
-        # *1. Face Detection*
-        faces = detect_face(img)
-        if len(faces) == 0:
-            return jsonify({"success": False, "message": "❌ Tidak ada wajah terdeteksi"}), 400
-
-        print("[INFO] Wajah terdeteksi!")
-
-        # *2. Face Tracking*
-        if tracker is None:
-            # Inisialisasi tracker jika belum ada
-            bbox = tuple(faces[0])  # Ambil wajah pertama yang terdeteksi
-            try:
-                # Coba gunakan cv2.legacy.TrackerKCF_create() untuk OpenCV >= 4.5.0
-                tracker = cv2.legacy.TrackerKCF_create()
-            except AttributeError:
-                # Jika gagal, gunakan cv2.TrackerKCF_create() untuk OpenCV < 4.5.0
-                tracker = cv2.TrackerKCF_create()
-            tracker.init(img, bbox)
-        else:
-            # Update tracker dengan frame saat ini
-            success, bbox = tracker.update(img)
-            if not success:
-                print("[WARNING] Tracking gagal! Menginisialisasi ulang tracker.")
-                tracker = None
-                return jsonify({"success": False, "message": "❌ Gagal melacak wajah"}), 400
-
-        # Gambar bounding box pada wajah yang dilacak
-        x, y, w, h = map(int, bbox)
-        cv2.rectangle(img, (x, y), (x + w, y + h), (255, 0, 0), 2)
-
         # *3. Anti-Spoofing Detection dengan DeepFace*
         try:
-            # Simpan gambar sementara untuk digunakan oleh DeepFace
-            temp_image_path = "temp_image.jpg"
-            cv2.imwrite(temp_image_path, img)
-
             # Gunakan DeepFace untuk deteksi keaslian wajah (anti-spoofing)
-            face_objs = DeepFace.extract_faces(img_path=temp_image_path, detector_backend='opencv', enforce_detection=False, anti_spoofing=True)
+            face_objs = DeepFace.extract_faces(img_path=image, detector_backend='opencv', enforce_detection=False, anti_spoofing=True)
             
             # Periksa apakah semua wajah yang terdeteksi adalah asli
             if all(face_obj["is_real"] is True for face_obj in face_objs):
@@ -257,33 +229,69 @@ def liveness_detection():
         except Exception as e:
             print("[ERROR] Anti-spoofing gagal:", str(e))
             return jsonify({"success": False, "message": f"Gagal melakukan anti-spoofing: {str(e)}"}), 500
-        finally:
-            # Hapus gambar sementara
-            if os.path.exists(temp_image_path):
-                os.remove(temp_image_path)
 
     except Exception as e:
         print("[ERROR] Server error:", str(e))
         return jsonify({"success": False, "message": f"Server error: {str(e)}"}), 500
+    
+@app.route('/validate', methods=['POST'])
+def validation():
+    # calculate processing time
+    start_time = time.time()
+
+    liveness = False
+    recognized_faces = []
+    if 'file' not in request.files:
+        return jsonify({
+            "success": False,
+            "error": "No file provided"
+            }), 400
+    
+    file = request.files['file']
+    try:
+        image = imread(file)
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Failed to read image: {e}"
+            }), 400
+
+    try:
+        face_objs = DeepFace.extract_faces(img_path=image, detector_backend='opencv', enforce_detection=False, anti_spoofing=True)
+        if all(face_obj["is_real"] is False for face_obj in face_objs):
+            print("[WARNING] Wajah palsu terdeteksi!")
+            liveness = False
+            return jsonify({
+                "success": False,
+                "liveness": liveness,
+                "recognized_faces": recognized_faces,
+                "processing_time": calculate_time_difference(start_time),
+                "message": "Spoofing terdeteksi!"
+                })
+        else:
+            liveness = True
+            print("[INFO] Wajah asli terdeteksi!")
+            dist_thresh = request.form.get('dist_thresh', default=0.65, type=float)
+            rec_dist, rec_class, bbs, ccs = recognize_image(det, face_model, image_class_name, embeddings, image, dist_thresh)
+            response = {
+                "success": False,
+                "liveness": liveness,
+                "processing_time": calculate_time_difference(start_time),
+                "recognized_faces": [
+                    {
+                        "label": label,
+                        "distance": round(float(dist), 2),
+                    }
+                    for label, dist, bb in zip(rec_class, rec_dist, bbs)
+                ],
+                "message": "Liveness detected! Wajah asli terdeteksi!",
+            }
+            return jsonify(response)
+    except Exception as e:
+        print("[ERROR] Validasi gagal:", str(e))
+        return jsonify({"success": False, "message": f"Gagal melakukan anti-spoofing: {str(e)}"}), 500
 
 # Run the Flask app
 if __name__ == "__main__":    
     print("run app...")
     app.run(debug=True, port=os.getenv("PORT", default=5000))
-
-
-# model_file = "models/GhostFaceNet_W1.3_S2_ArcFace.h5"
-# embeddings_file = "known_user/image-dataset_aligned_112_112_embedding.npz"
-# image_path = 'check/hazman.jpg'
-# dist_thresh = 0.6
-# known_user = "known_user/embeddings.npz"
-# det, face_model = init_det_and_emb_model(model_file)
-# image_classes, image_class_name, embeddings, embbeddings_file_path = read_embedding_file(known_user)
-# frame = imread(image_path)
-# rec_dist, rec_class, bbs, ccs = recognize_image(det, face_model, image_classes, image_class_name, embeddings, frame, dist_thresh)
-# print(rec_class)
-# print(rec_dist)
-# embeddings_file = "known_user/embeddings.npz"
-# known_user = '/kaggle/working/image-dataset_aligned_112_112/'
-# image_classes, image_class_name, embeddings = embedding_images(det, face_model, known_user)
-# rec_dist, rec_class, bbs = recognize_image(det, face_model, image_classes, embeddings, frame, dist_thresh)
